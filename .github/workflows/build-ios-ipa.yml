@@ -34,24 +34,20 @@ jobs:
           fetch-depth: 0
 
       - name: Initialize MPVKit submodule only
+        shell: bash
         run: |
           set -euo pipefail
 
           echo "Synchronizing MPVKit submodule..."
           git submodule sync -- MPVKit
 
-          echo "Initializing MPVKit without recursive submodules..."
+          echo "Initializing MPVKit without nested submodules..."
           git submodule update \
             --init \
             --force \
             --depth 1 \
             --single-branch \
             -- MPVKit
-
-          if [[ ! -d "MPVKit" ]]; then
-            echo "::error::MPVKit directory was not created"
-            exit 1
-          fi
 
           if [[ ! -f "MPVKit/Package.swift" ]]; then
             echo "::error::MPVKit/Package.swift was not found"
@@ -67,9 +63,9 @@ jobs:
 
           echo "MPVKit initialized successfully:"
           git -C MPVKit rev-parse HEAD
-          ls -la MPVKit
 
       - name: Select Xcode 16.4
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -92,12 +88,68 @@ jobs:
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
+      - name: Create local.properties
+        shell: bash
+        env:
+          NUVIO_SUPABASE_URL: ${{ secrets.NUVIO_SUPABASE_URL }}
+          NUVIO_SUPABASE_ANON_KEY: ${{ secrets.NUVIO_SUPABASE_ANON_KEY }}
+          NUVIO_SUPABASE_FALLBACK_URL: ${{ secrets.NUVIO_SUPABASE_FALLBACK_URL }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          NUVIO_REALTIME_SYNC_ENABLED: ${{ secrets.NUVIO_REALTIME_SYNC_ENABLED }}
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+          TRAKT_REDIRECT_URI: ${{ secrets.TRAKT_REDIRECT_URI }}
+          INTRODB_API_URL: ${{ secrets.INTRODB_API_URL }}
+          IMDB_RATINGS_API_BASE_URL: ${{ secrets.IMDB_RATINGS_API_BASE_URL }}
+          IMDB_TAPFRAME_API_BASE_URL: ${{ secrets.IMDB_TAPFRAME_API_BASE_URL }}
+          PREMIUMIZE_CLIENT_ID: ${{ secrets.PREMIUMIZE_CLIENT_ID }}
+          CONTRIBUTIONS_URL: ${{ secrets.CONTRIBUTIONS_URL }}
+          DONATIONS_BASE_URL: ${{ secrets.DONATIONS_BASE_URL }}
+          DONATIONS_DONATE_URL: ${{ secrets.DONATIONS_DONATE_URL }}
+        run: |
+          set -euo pipefail
+
+          {
+            printf 'NUVIO_SUPABASE_URL=%s\n' "${NUVIO_SUPABASE_URL:-}"
+            printf 'NUVIO_SUPABASE_ANON_KEY=%s\n' "${NUVIO_SUPABASE_ANON_KEY:-}"
+            printf 'NUVIO_SUPABASE_FALLBACK_URL=%s\n' "${NUVIO_SUPABASE_FALLBACK_URL:-}"
+            printf 'SENTRY_DSN=%s\n' "${SENTRY_DSN:-}"
+            printf 'NUVIO_REALTIME_SYNC_ENABLED=%s\n' \
+              "${NUVIO_REALTIME_SYNC_ENABLED:-true}"
+
+            printf 'TRAKT_CLIENT_ID=%s\n' "${TRAKT_CLIENT_ID:-}"
+            printf 'TRAKT_CLIENT_SECRET=%s\n' "${TRAKT_CLIENT_SECRET:-}"
+            printf 'TRAKT_REDIRECT_URI=%s\n' \
+              "${TRAKT_REDIRECT_URI:-nuvio://auth/trakt}"
+
+            printf 'INTRODB_API_URL=%s\n' "${INTRODB_API_URL:-}"
+            printf 'IMDB_RATINGS_API_BASE_URL=%s\n' \
+              "${IMDB_RATINGS_API_BASE_URL:-}"
+            printf 'IMDB_TAPFRAME_API_BASE_URL=%s\n' \
+              "${IMDB_TAPFRAME_API_BASE_URL:-}"
+            printf 'PREMIUMIZE_CLIENT_ID=%s\n' \
+              "${PREMIUMIZE_CLIENT_ID:-}"
+
+            printf 'CONTRIBUTIONS_URL=%s\n' "${CONTRIBUTIONS_URL:-}"
+            printf 'DONATIONS_BASE_URL=%s\n' "${DONATIONS_BASE_URL:-}"
+            printf 'DONATIONS_DONATE_URL=%s\n' \
+              "${DONATIONS_DONATE_URL:-}"
+          } > local.properties
+
+          test -f local.properties
+
+          echo "local.properties created."
+          echo "Configured property names:"
+          sed 's/=.*$/=<redacted>/' local.properties
+
       - name: Verify project files
+        shell: bash
         run: |
           set -euo pipefail
 
           required_files=(
             "gradlew"
+            "local.properties"
             "MPVKit/Package.swift"
             "iosApp/iosApp.xcodeproj/project.pbxproj"
             "iosApp/iosApp.xcodeproj/xcshareddata/xcschemes/iosApp.xcscheme"
@@ -111,6 +163,7 @@ jobs:
           done
 
       - name: Resolve Swift packages
+        shell: bash
         run: |
           set -o pipefail
 
@@ -122,12 +175,14 @@ jobs:
             | tee "$RUNNER_TEMP/resolve-packages.log"
 
       - name: Archive iOS app without signing
+        shell: bash
         env:
           GRADLE_OPTS: >-
             -Xmx12g
             -Dfile.encoding=UTF-8
             -XX:MaxMetaspaceSize=2g
           KOTLIN_DAEMON_JVMARGS: -Xmx8g
+          NUVIO_IOS_DISTRIBUTION: appstore
         run: |
           set -o pipefail
 
@@ -147,22 +202,24 @@ jobs:
 
       - name: Locate archived application
         id: locate-app
+        shell: bash
         run: |
           set -euo pipefail
 
           ARCHIVE_PATH="$RUNNER_TEMP/Nuvio.xcarchive"
-          EXPECTED_APP="$ARCHIVE_PATH/Products/Applications/Nuvio.app"
+          APPLICATIONS_PATH="$ARCHIVE_PATH/Products/Applications"
+          EXPECTED_APP="$APPLICATIONS_PATH/Nuvio.app"
 
           if [[ -d "$EXPECTED_APP" ]]; then
             APP_PATH="$EXPECTED_APP"
           else
             APP_PATH="$(
-              find "$ARCHIVE_PATH/Products/Applications" \
+              find "$APPLICATIONS_PATH" \
                 -maxdepth 1 \
                 -type d \
                 -name "*.app" \
                 -print \
-                -quit
+                -quit 2>/dev/null || true
             )"
           fi
 
@@ -179,6 +236,7 @@ jobs:
           echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Package unsigned IPA
+        shell: bash
         env:
           APP_PATH: ${{ steps.locate-app.outputs.app_path }}
         run: |
@@ -225,13 +283,14 @@ jobs:
           retention-days: 14
           compression-level: 0
 
-      - name: Upload build logs on failure
+      - name: Upload build diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Nuvio-iOS-build-logs-${{ github.sha }}
+          name: Nuvio-iOS-build-diagnostics-${{ github.sha }}
           path: |
             ${{ runner.temp }}/resolve-packages.log
             ${{ runner.temp }}/xcodebuild.log
+            build/reports/problems
           if-no-files-found: ignore
           retention-days: 7
