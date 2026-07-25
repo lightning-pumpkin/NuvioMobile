@@ -1,4 +1,4 @@
-name: Build iOS IPA
+name: Build iOS IPA and Release
 
 on:
   workflow_dispatch:
@@ -6,15 +6,15 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
+    tags-ignore:
+      - "*"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: ios-ipa-${{ github.ref }}
-  cancel-in-progress: true
+  group: ios-ipa-release
+  cancel-in-progress: false
 
 env:
   JAVA_VERSION: "17"
@@ -24,7 +24,7 @@ env:
 
 jobs:
   build-ios-ipa:
-    name: Build unsigned iOS IPA
+    name: Build and release unsigned iOS IPA
     runs-on: macos-15
 
     steps:
@@ -33,6 +33,53 @@ jobs:
         with:
           submodules: false
           fetch-depth: 1
+
+      - name: Generate release version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          export TZ="Europe/Rome"
+
+          RELEASE_TIME="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+          VERSION_DATE="$(date '+%Y.%m.%d.%H%M')"
+
+          VERSION="$VERSION_DATE"
+          OFFSET=0
+
+          while gh release view "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            >/dev/null 2>&1 ||
+            git ls-remote \
+              --exit-code \
+              --tags \
+              origin \
+              "refs/tags/$VERSION" \
+              >/dev/null 2>&1
+          do
+            OFFSET=$((OFFSET + 1))
+
+            VERSION="$(
+              date \
+                -v+"${OFFSET}"M \
+                '+%Y.%m.%d.%H%M'
+            )"
+          done
+
+          IPA_NAME="Nuvio-${VERSION}-unsigned.ipa"
+          IPA_PATH="$GITHUB_WORKSPACE/$IPA_NAME"
+
+          echo "Release time: $RELEASE_TIME"
+          echo "Release version: $VERSION"
+          echo "IPA filename: $IPA_NAME"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_time=$RELEASE_TIME" >> "$GITHUB_OUTPUT"
+          echo "ipa_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+          echo "ipa_path=$IPA_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Initialize MPVKit submodule
         shell: bash
@@ -50,8 +97,10 @@ jobs:
 
           if [[ ! -f "MPVKit/Package.swift" ]]; then
             echo "::error::MPVKit/Package.swift was not found"
+
             git submodule status -- MPVKit || true
             find MPVKit -maxdepth 3 -print || true
+
             exit 1
           fi
 
@@ -93,21 +142,25 @@ jobs:
           )"
 
           echo "iPhoneOS SDK: $SDK_VERSION"
+
           echo "xcode_path=$XCODE_PATH" >> "$GITHUB_OUTPUT"
           echo "sdk_version=$SDK_VERSION" >> "$GITHUB_OUTPUT"
 
           SDK_MAJOR="${SDK_VERSION%%.*}"
 
           if (( SDK_MAJOR < 26 )); then
-            echo "::error::This source requires the iOS 26 SDK or newer."
+            echo "::error::This project requires the iOS 26 SDK or newer."
             echo "::error::Available SDK version is $SDK_VERSION."
+
             echo "Installed Xcode applications:"
+
             find /Applications \
               -maxdepth 1 \
               -type d \
               -name 'Xcode*.app' \
               -print |
               sort -V
+
             exit 1
           fi
 
@@ -120,8 +173,6 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          cache-read-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
@@ -332,6 +383,7 @@ jobs:
             echo "::error::No iOS application was produced"
 
             echo "Build products:"
+
             find \
               "$DERIVED_DATA_PATH/Build/Products" \
               -maxdepth 4 \
@@ -347,11 +399,11 @@ jobs:
         shell: bash
         env:
           APP_PATH: ${{ steps.locate-app.outputs.app_path }}
+          IPA_PATH: ${{ steps.version.outputs.ipa_path }}
         run: |
           set -euo pipefail
 
           IPA_ROOT="$RUNNER_TEMP/ipa"
-          IPA_PATH="$GITHUB_WORKSPACE/Nuvio-unsigned.ipa"
           APP_NAME="$(basename "$APP_PATH")"
 
           rm -rf "$IPA_ROOT"
@@ -381,14 +433,45 @@ jobs:
           echo "IPA created:"
           ls -lh "$IPA_PATH"
 
-      - name: Upload IPA
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Nuvio-iOS-unsigned-${{ github.sha }}
-          path: Nuvio-unsigned.ipa
+          name: Nuvio-${{ steps.version.outputs.version }}
+          path: ${{ steps.version.outputs.ipa_path }}
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TIME: ${{ steps.version.outputs.release_time }}
+          IPA_PATH: ${{ steps.version.outputs.ipa_path }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_NOTES="$RUNNER_TEMP/release-notes.md"
+
+          {
+            echo "## Nuvio iOS"
+            echo
+            echo "- Version: \`$RELEASE_VERSION\`"
+            echo "- Built: $RELEASE_TIME"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Branch: \`$GITHUB_REF_NAME\`"
+            echo
+            echo "This release contains an unsigned iOS IPA."
+          } > "$RELEASE_NOTES"
+
+          gh release create "$RELEASE_VERSION" \
+            "$IPA_PATH" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Nuvio $RELEASE_VERSION" \
+            --notes-file "$RELEASE_NOTES" \
+            --latest
 
       - name: Upload build log on failure
         if: failure()
