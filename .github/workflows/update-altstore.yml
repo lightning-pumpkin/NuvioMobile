@@ -1,0 +1,589 @@
+name: Update AltStore Source
+
+on:
+  release:
+    types:
+      - published
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub Release tag to publish in AltStore (leave empty for latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-altstore-source
+  cancel-in-progress: false
+
+jobs:
+  update-altstore:
+    name: Update source.json
+    runs-on: macos-latest
+
+    env:
+      ALTSTORE_BRANCH: altstore
+      SOURCE_FILE: source.json
+      MAX_VERSIONS: "50"
+      MAX_NEWS_ITEMS: "20"
+
+    steps:
+      - name: Determine release tag
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          EVENT_RELEASE_NAME: ${{ github.event.release.name }}
+          EVENT_RELEASE_BODY: ${{ github.event.release.body }}
+          EVENT_PUBLISHED_AT: ${{ github.event.release.published_at }}
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="$EVENT_TAG"
+            RELEASE_NAME="$EVENT_RELEASE_NAME"
+            RELEASE_BODY="$EVENT_RELEASE_BODY"
+            PUBLISHED_AT="$EVENT_PUBLISHED_AT"
+          else
+            TAG="$MANUAL_TAG"
+
+            if [[ -z "$TAG" ]]; then
+              TAG="$(gh release view \
+                --repo "$GITHUB_REPOSITORY" \
+                --json tagName \
+                --jq '.tagName')"
+            fi
+
+            RELEASE_NAME="$(gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json name \
+              --jq '.name // empty')"
+
+            RELEASE_BODY="$(gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json body \
+              --jq '.body // empty')"
+
+            PUBLISHED_AT="$(gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json publishedAt \
+              --jq '.publishedAt // empty')"
+          fi
+
+          if [[ -z "$TAG" ]]; then
+            echo "::error::Unable to determine the GitHub Release tag."
+            exit 1
+          fi
+
+          if [[ -z "$RELEASE_NAME" ]]; then
+            RELEASE_NAME="$TAG"
+          fi
+
+          if [[ -z "$PUBLISHED_AT" ]]; then
+            PUBLISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "release_name=$RELEASE_NAME"
+            echo "published_at=$PUBLISHED_AT"
+
+            echo "release_body<<ALTSTORE_RELEASE_BODY"
+            printf '%s\n' "$RELEASE_BODY"
+            echo "ALTSTORE_RELEASE_BODY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout AltStore branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.ALTSTORE_BRANCH }}
+          path: altstore-source
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify AltStore source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_PATH="altstore-source/$SOURCE_FILE"
+
+          if [[ ! -f "$SOURCE_PATH" ]]; then
+            echo "::error::$SOURCE_FILE was not found in the $ALTSTORE_BRANCH branch."
+            exit 1
+          fi
+
+          python3 -m json.tool "$SOURCE_PATH" >/dev/null
+
+      - name: Download IPA from GitHub Release
+        id: ipa
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-assets
+
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "*.ipa" \
+            --dir release-assets
+
+          mapfile -t IPA_FILES < <(find release-assets -type f -name "*.ipa" | sort)
+
+          if [[ "${#IPA_FILES[@]}" -eq 0 ]]; then
+            echo "::error::The release '$RELEASE_TAG' does not contain an IPA asset."
+            exit 1
+          fi
+
+          if [[ "${#IPA_FILES[@]}" -gt 1 ]]; then
+            echo "::error::The release contains more than one IPA asset. Keep exactly one IPA per release."
+            printf 'Found: %s\n' "${IPA_FILES[@]}"
+            exit 1
+          fi
+
+          IPA_PATH="${IPA_FILES[0]}"
+          IPA_NAME="$(basename "$IPA_PATH")"
+
+          {
+            echo "path=$IPA_PATH"
+            echo "name=$IPA_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract IPA
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.ipa.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted-ipa
+          mkdir -p extracted-ipa
+
+          ditto -x -k "$IPA_PATH" extracted-ipa
+
+          APP_PATH="$(find extracted-ipa/Payload \
+            -maxdepth 1 \
+            -type d \
+            -name "*.app" \
+            -print \
+            -quit)"
+
+          if [[ -z "$APP_PATH" ]]; then
+            echo "::error::No .app bundle was found inside the IPA."
+            exit 1
+          fi
+
+          if [[ ! -f "$APP_PATH/Info.plist" ]]; then
+            echo "::error::The application Info.plist was not found."
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Extract entitlements
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted-entitlements
+          mkdir -p extracted-entitlements
+
+          FOUND_ENTITLEMENTS=false
+          INDEX=0
+
+          while IFS= read -r TARGET; do
+            OUTPUT="extracted-entitlements/entitlements-${INDEX}.plist"
+
+            if codesign -d --entitlements :- "$TARGET" >"$OUTPUT" 2>/dev/null; then
+              if [[ -s "$OUTPUT" ]]; then
+                FOUND_ENTITLEMENTS=true
+                INDEX=$((INDEX + 1))
+              else
+                rm -f "$OUTPUT"
+              fi
+            else
+              rm -f "$OUTPUT"
+            fi
+          done < <(
+            {
+              printf '%s\n' "$APP_PATH"
+              find "$APP_PATH" -type d -name "*.appex" -print
+            } | sort -u
+          )
+
+          echo "ENTITLEMENTS_FOUND=$FOUND_ENTITLEMENTS" >> "$GITHUB_ENV"
+
+          if [[ "$FOUND_ENTITLEMENTS" == "false" ]]; then
+            echo "::warning::No code-signing entitlements could be extracted. Existing entitlements in source.json will be preserved."
+          fi
+
+      - name: Update source.json
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.ipa.outputs.path }}
+          IPA_NAME: ${{ steps.ipa.outputs.name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_NAME: ${{ steps.release.outputs.release_name }}
+          RELEASE_BODY: ${{ steps.release.outputs.release_body }}
+          RELEASE_DATE: ${{ steps.release.outputs.published_at }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYTHON'
+          import json
+          import os
+          import plistlib
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import quote
+
+          source_path = Path("altstore-source") / os.environ["SOURCE_FILE"]
+          app_path = Path(os.environ["APP_PATH"])
+          info_path = app_path / "Info.plist"
+          ipa_path = Path(os.environ["IPA_PATH"])
+
+          with info_path.open("rb") as file:
+              info = plistlib.load(file)
+
+          def require_string(key: str) -> str:
+              value = info.get(key)
+              if value is None or str(value).strip() == "":
+                  raise RuntimeError(f"Required Info.plist key is missing: {key}")
+              return str(value).strip()
+
+          bundle_identifier = require_string("CFBundleIdentifier")
+          version = require_string("CFBundleShortVersionString")
+          build_version = require_string("CFBundleVersion")
+
+          app_name = (
+              info.get("CFBundleDisplayName")
+              or info.get("CFBundleName")
+              or bundle_identifier
+          )
+          app_name = str(app_name).strip()
+
+          minimum_os = info.get("MinimumOSVersion")
+          if minimum_os is not None:
+              minimum_os = str(minimum_os).strip()
+
+          ipa_size = ipa_path.stat().st_size
+          repository = os.environ["GITHUB_REPOSITORY"]
+          release_tag = os.environ["RELEASE_TAG"]
+          ipa_name = os.environ["IPA_NAME"]
+
+          encoded_tag = quote(release_tag, safe="")
+          encoded_name = quote(ipa_name, safe="")
+          download_url = (
+              f"https://github.com/{repository}/releases/download/"
+              f"{encoded_tag}/{encoded_name}"
+          )
+
+          release_body = os.environ.get("RELEASE_BODY", "").strip()
+          localized_description = release_body or f"Nuvio {version} build {build_version}."
+
+          release_date = os.environ["RELEASE_DATE"]
+          release_name = os.environ.get("RELEASE_NAME", "").strip()
+          news_title = release_name or f"{app_name} {version}"
+
+          caption_source = re.sub(r"\s+", " ", release_body).strip()
+          if not caption_source:
+              caption_source = f"{app_name} {version} is now available."
+
+          max_caption_length = 180
+          if len(caption_source) > max_caption_length:
+              caption_source = caption_source[: max_caption_length - 1].rstrip() + "…"
+
+          privacy = {}
+          for key, value in info.items():
+              if key.endswith("UsageDescription") and isinstance(value, str):
+                  privacy[key] = value
+
+          ignored_entitlements = {
+              "application-identifier",
+              "com.apple.developer.team-identifier",
+          }
+
+          extracted_entitlements = set()
+          entitlements_directory = Path("extracted-entitlements")
+
+          for entitlement_path in sorted(entitlements_directory.glob("*.plist")):
+              try:
+                  with entitlement_path.open("rb") as file:
+                      entitlement_data = plistlib.load(file)
+
+                  if isinstance(entitlement_data, dict):
+                      extracted_entitlements.update(entitlement_data.keys())
+              except Exception as error:
+                  print(
+                      f"Warning: could not parse {entitlement_path}: {error}",
+                      file=sys.stderr,
+                  )
+
+          extracted_entitlements.difference_update(ignored_entitlements)
+
+          with source_path.open("r", encoding="utf-8") as file:
+              source = json.load(file)
+
+          apps = source.get("apps")
+          if not isinstance(apps, list) or not apps:
+              raise RuntimeError("source.json must contain a non-empty 'apps' array.")
+
+          matching_app = next(
+              (
+                  app
+                  for app in apps
+                  if app.get("bundleIdentifier") == bundle_identifier
+              ),
+              None,
+          )
+
+          if matching_app is None:
+              if len(apps) == 1:
+                  matching_app = apps[0]
+                  previous_bundle = matching_app.get("bundleIdentifier")
+                  print(
+                      "No exact bundle identifier match was found. "
+                      f"Updating the only app entry from "
+                      f"{previous_bundle!r} to {bundle_identifier!r}."
+                  )
+                  matching_app["bundleIdentifier"] = bundle_identifier
+              else:
+                  raise RuntimeError(
+                      "No app in source.json matches bundle identifier "
+                      f"{bundle_identifier!r}."
+                  )
+
+          matching_app["name"] = matching_app.get("name") or app_name
+          matching_app["bundleIdentifier"] = bundle_identifier
+
+          versions = matching_app.get("versions")
+          if not isinstance(versions, list):
+              versions = []
+
+          new_version = {
+              "version": version,
+              "buildVersion": build_version,
+              "date": release_date,
+              "localizedDescription": localized_description,
+              "downloadURL": download_url,
+              "size": ipa_size,
+          }
+
+          if minimum_os:
+              new_version["minOSVersion"] = minimum_os
+
+          versions = [
+              existing
+              for existing in versions
+              if not (
+                  str(existing.get("version", "")) == version
+                  and str(existing.get("buildVersion", "")) == build_version
+              )
+          ]
+
+          max_versions = int(os.environ.get("MAX_VERSIONS", "50"))
+          matching_app["versions"] = [new_version, *versions][:max_versions]
+
+          permissions = matching_app.get("appPermissions")
+          if not isinstance(permissions, dict):
+              permissions = {}
+
+          existing_entitlements = permissions.get("entitlements")
+          if not isinstance(existing_entitlements, list):
+              existing_entitlements = []
+
+          if extracted_entitlements:
+              permissions["entitlements"] = sorted(extracted_entitlements)
+          else:
+              permissions["entitlements"] = existing_entitlements
+
+          permissions["privacy"] = dict(sorted(privacy.items()))
+          matching_app["appPermissions"] = permissions
+
+          news = source.get("news")
+          if not isinstance(news, list):
+              news = []
+
+          news_identifier = (
+              f"{bundle_identifier}-{version}-{build_version}"
+          )
+
+          news_item = {
+              "title": news_title,
+              "identifier": news_identifier,
+              "caption": caption_source,
+              "date": release_date,
+              "appID": bundle_identifier,
+              "url": (
+                  f"https://github.com/{repository}/releases/tag/"
+                  f"{encoded_tag}"
+              ),
+          }
+
+          news = [
+              existing
+              for existing in news
+              if existing.get("identifier") != news_identifier
+          ]
+
+          max_news_items = int(os.environ.get("MAX_NEWS_ITEMS", "20"))
+          source["news"] = [news_item, *news][:max_news_items]
+
+          temporary_path = source_path.with_suffix(".json.tmp")
+          with temporary_path.open("w", encoding="utf-8") as file:
+              json.dump(
+                  source,
+                  file,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+              file.write("\n")
+
+          temporary_path.replace(source_path)
+
+          print(f"Application: {app_name}")
+          print(f"Bundle identifier: {bundle_identifier}")
+          print(f"Version: {version}")
+          print(f"Build: {build_version}")
+          print(f"Minimum iOS: {minimum_os or 'not declared'}")
+          print(f"IPA size: {ipa_size} bytes")
+          print(f"Download URL: {download_url}")
+          print(f"Privacy permissions: {len(privacy)}")
+          print(f"Entitlements: {len(permissions['entitlements'])}")
+          PYTHON
+
+      - name: Validate updated AltStore source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_PATH="altstore-source/$SOURCE_FILE"
+
+          python3 -m json.tool "$SOURCE_PATH" >/dev/null
+
+          python3 <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          source_path = Path("altstore-source") / os.environ["SOURCE_FILE"]
+
+          with source_path.open("r", encoding="utf-8") as file:
+              source = json.load(file)
+
+          if not isinstance(source.get("name"), str) or not source["name"].strip():
+              raise RuntimeError("The source requires a non-empty 'name'.")
+
+          apps = source.get("apps")
+          if not isinstance(apps, list) or not apps:
+              raise RuntimeError("The source requires at least one app.")
+
+          required_app_keys = {
+              "name",
+              "bundleIdentifier",
+              "developerName",
+              "localizedDescription",
+              "iconURL",
+              "versions",
+              "appPermissions",
+          }
+
+          required_version_keys = {
+              "version",
+              "buildVersion",
+              "date",
+              "downloadURL",
+              "size",
+          }
+
+          for app in apps:
+              missing_app_keys = sorted(required_app_keys - app.keys())
+              if missing_app_keys:
+                  raise RuntimeError(
+                      f"App {app.get('name', '<unknown>')} is missing keys: "
+                      + ", ".join(missing_app_keys)
+                  )
+
+              permissions = app["appPermissions"]
+              if not isinstance(permissions.get("entitlements"), list):
+                  raise RuntimeError(
+                      f"{app['name']}: appPermissions.entitlements must be an array."
+                  )
+
+              if not isinstance(permissions.get("privacy"), dict):
+                  raise RuntimeError(
+                      f"{app['name']}: appPermissions.privacy must be an object."
+                  )
+
+              versions = app["versions"]
+              if not isinstance(versions, list) or not versions:
+                  raise RuntimeError(
+                      f"{app['name']} must contain at least one version."
+                  )
+
+              for version in versions:
+                  missing_version_keys = sorted(
+                      required_version_keys - version.keys()
+                  )
+                  if missing_version_keys:
+                      raise RuntimeError(
+                          f"{app['name']} version entry is missing keys: "
+                          + ", ".join(missing_version_keys)
+                      )
+
+          latest_app = apps[0]
+          latest_version = latest_app["versions"][0]
+
+          request = Request(
+              latest_version["downloadURL"],
+              method="HEAD",
+              headers={"User-Agent": "Nuvio-AltStore-Source-Validator"},
+          )
+
+          with urlopen(request, timeout=30) as response:
+              status = response.status
+
+          if status < 200 or status >= 400:
+              raise RuntimeError(
+                  f"IPA download URL returned HTTP {status}."
+              )
+
+          print("AltStore source validation completed successfully.")
+          PYTHON
+
+      - name: Show source changes
+        shell: bash
+        working-directory: altstore-source
+        run: |
+          set -euo pipefail
+          git diff -- "$SOURCE_FILE"
+
+      - name: Commit and push AltStore source
+        shell: bash
+        working-directory: altstore-source
+        env:
+          VERSION_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- "$SOURCE_FILE"; then
+            echo "source.json is already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$SOURCE_FILE"
+          git commit -m "Update AltStore source for ${VERSION_TAG}"
+          git push origin "HEAD:${ALTSTORE_BRANCH}"
