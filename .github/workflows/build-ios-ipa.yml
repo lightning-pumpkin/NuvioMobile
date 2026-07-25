@@ -27,30 +27,57 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout repository and submodules
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
           fetch-depth: 0
 
-      - name: Verify MPVKit submodule
+      - name: Initialize MPVKit submodule only
         run: |
           set -euo pipefail
 
-          git submodule status
-          git submodule update --init --recursive
+          echo "Synchronizing MPVKit submodule..."
+          git submodule sync -- MPVKit
 
-          if [[ ! -f "MPVKit/Package.swift" ]]; then
-            echo "::error::MPVKit/Package.swift was not found"
-            echo "Current MPVKit contents:"
-            find MPVKit -maxdepth 3 -print || true
+          echo "Initializing MPVKit without recursive submodules..."
+          git submodule update \
+            --init \
+            --force \
+            --depth 1 \
+            --single-branch \
+            -- MPVKit
+
+          if [[ ! -d "MPVKit" ]]; then
+            echo "::error::MPVKit directory was not created"
             exit 1
           fi
 
+          if [[ ! -f "MPVKit/Package.swift" ]]; then
+            echo "::error::MPVKit/Package.swift was not found"
+
+            echo "MPVKit submodule status:"
+            git submodule status -- MPVKit || true
+
+            echo "MPVKit directory contents:"
+            find MPVKit -maxdepth 3 -print || true
+
+            exit 1
+          fi
+
+          echo "MPVKit initialized successfully:"
+          git -C MPVKit rev-parse HEAD
+          ls -la MPVKit
+
       - name: Select Xcode 16.4
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          set -euo pipefail
+
+          sudo xcode-select \
+            -s /Applications/Xcode_16.4.app/Contents/Developer
+
           xcodebuild -version
+          swift --version
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -65,6 +92,24 @@ jobs:
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
+      - name: Verify project files
+        run: |
+          set -euo pipefail
+
+          required_files=(
+            "gradlew"
+            "MPVKit/Package.swift"
+            "iosApp/iosApp.xcodeproj/project.pbxproj"
+            "iosApp/iosApp.xcodeproj/xcshareddata/xcschemes/iosApp.xcscheme"
+          )
+
+          for file in "${required_files[@]}"; do
+            if [[ ! -e "$file" ]]; then
+              echo "::error::Required file not found: $file"
+              exit 1
+            fi
+          done
+
       - name: Resolve Swift packages
         run: |
           set -o pipefail
@@ -73,6 +118,7 @@ jobs:
             -resolvePackageDependencies \
             -project iosApp/iosApp.xcodeproj \
             -scheme iosApp \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
             | tee "$RUNNER_TEMP/resolve-packages.log"
 
       - name: Archive iOS app without signing
@@ -91,42 +137,84 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath "$RUNNER_TEMP/Nuvio.xcarchive" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
             | tee "$RUNNER_TEMP/xcodebuild.log"
 
-      - name: Package unsigned IPA
+      - name: Locate archived application
+        id: locate-app
         run: |
           set -euo pipefail
 
           ARCHIVE_PATH="$RUNNER_TEMP/Nuvio.xcarchive"
-          APP_PATH="$ARCHIVE_PATH/Products/Applications/Nuvio.app"
-          IPA_DIRECTORY="$RUNNER_TEMP/ipa"
-          IPA_PATH="$GITHUB_WORKSPACE/Nuvio-unsigned.ipa"
+          EXPECTED_APP="$ARCHIVE_PATH/Products/Applications/Nuvio.app"
 
-          if [[ ! -d "$APP_PATH" ]]; then
-            echo "::error::Archived app was not found at $APP_PATH"
+          if [[ -d "$EXPECTED_APP" ]]; then
+            APP_PATH="$EXPECTED_APP"
+          else
+            APP_PATH="$(
+              find "$ARCHIVE_PATH/Products/Applications" \
+                -maxdepth 1 \
+                -type d \
+                -name "*.app" \
+                -print \
+                -quit
+            )"
+          fi
+
+          if [[ -z "${APP_PATH:-}" || ! -d "$APP_PATH" ]]; then
+            echo "::error::No application was found in the Xcode archive"
+
             echo "Archive contents:"
             find "$ARCHIVE_PATH" -maxdepth 6 -print || true
+
             exit 1
           fi
 
+          echo "Application found at: $APP_PATH"
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Package unsigned IPA
+        env:
+          APP_PATH: ${{ steps.locate-app.outputs.app_path }}
+        run: |
+          set -euo pipefail
+
+          IPA_DIRECTORY="$RUNNER_TEMP/ipa"
+          IPA_PATH="$GITHUB_WORKSPACE/Nuvio-unsigned.ipa"
+
           rm -rf "$IPA_DIRECTORY"
+          rm -f "$IPA_PATH"
+
           mkdir -p "$IPA_DIRECTORY/Payload"
 
-          cp -R "$APP_PATH" "$IPA_DIRECTORY/Payload/Nuvio.app"
+          APP_NAME="$(basename "$APP_PATH")"
+
+          ditto \
+            "$APP_PATH" \
+            "$IPA_DIRECTORY/Payload/$APP_NAME"
 
           cd "$IPA_DIRECTORY"
-          /usr/bin/zip -qry "$IPA_PATH" Payload
 
-          if [[ ! -f "$IPA_PATH" ]]; then
+          /usr/bin/zip \
+            -qry \
+            "$IPA_PATH" \
+            Payload
+
+          if [[ ! -s "$IPA_PATH" ]]; then
             echo "::error::IPA creation failed"
             exit 1
           fi
 
+          echo "IPA created successfully:"
           ls -lh "$IPA_PATH"
+
+          echo "IPA contents:"
+          unzip -l "$IPA_PATH" | head -100
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
