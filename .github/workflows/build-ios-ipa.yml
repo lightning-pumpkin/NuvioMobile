@@ -9,10 +9,6 @@ on:
     tags:
       - "v*"
 
-  pull_request:
-    branches:
-      - main
-
 permissions:
   contents: read
 
@@ -20,28 +16,32 @@ concurrency:
   group: ios-ipa-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  JAVA_VERSION: "17"
+  NUVIO_IOS_DISTRIBUTION: appstore
+  DERIVED_DATA_PATH: ${{ github.workspace }}/.build/DerivedData
+  SOURCE_PACKAGES_PATH: ${{ github.workspace }}/.build/SourcePackages
+
 jobs:
   build-ios-ipa:
     name: Build unsigned iOS IPA
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: false
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Initialize MPVKit submodule only
+      - name: Initialize MPVKit submodule
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Synchronizing MPVKit submodule..."
           git submodule sync -- MPVKit
 
-          echo "Initializing MPVKit without nested submodules..."
           git submodule update \
             --init \
             --force \
@@ -51,42 +51,106 @@ jobs:
 
           if [[ ! -f "MPVKit/Package.swift" ]]; then
             echo "::error::MPVKit/Package.swift was not found"
-
-            echo "MPVKit submodule status:"
             git submodule status -- MPVKit || true
-
-            echo "MPVKit directory contents:"
             find MPVKit -maxdepth 3 -print || true
-
             exit 1
           fi
 
-          echo "MPVKit initialized successfully:"
+          echo "MPVKit commit:"
           git -C MPVKit rev-parse HEAD
 
-      - name: Select Xcode 16.4
+      - name: Select latest installed Xcode
+        id: xcode
         shell: bash
         run: |
           set -euo pipefail
 
+          XCODE_PATH="$(
+            find /Applications \
+              -maxdepth 1 \
+              -type d \
+              -name 'Xcode*.app' \
+              -print |
+            sort -V |
+            tail -n 1
+          )"
+
+          if [[ -z "$XCODE_PATH" ]]; then
+            echo "::error::No Xcode installation was found"
+            exit 1
+          fi
+
+          echo "Selecting: $XCODE_PATH"
+
           sudo xcode-select \
-            -s /Applications/Xcode_16.4.app/Contents/Developer
+            --switch "$XCODE_PATH/Contents/Developer"
 
           xcodebuild -version
-          swift --version
 
-      - name: Setup Java 17
+          SDK_VERSION="$(
+            xcrun \
+              --sdk iphoneos \
+              --show-sdk-version
+          )"
+
+          echo "iPhoneOS SDK: $SDK_VERSION"
+          echo "xcode_path=$XCODE_PATH" >> "$GITHUB_OUTPUT"
+          echo "sdk_version=$SDK_VERSION" >> "$GITHUB_OUTPUT"
+
+          SDK_MAJOR="${SDK_VERSION%%.*}"
+
+          if (( SDK_MAJOR < 26 )); then
+            echo "::error::This source requires the iOS 26 SDK or newer."
+            echo "::error::Available SDK version is $SDK_VERSION."
+            echo "Installed Xcode applications:"
+            find /Applications \
+              -maxdepth 1 \
+              -type d \
+              -name 'Xcode*.app' \
+              -print |
+              sort -V
+            exit 1
+          fi
+
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: ${{ env.JAVA_VERSION }}
           cache: gradle
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
 
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
+
+      - name: Restore Kotlin Native cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.konan
+          key: >-
+            konan-${{ runner.os }}-${{ runner.arch }}-
+            ${{ hashFiles('gradle/libs.versions.toml', '**/*.gradle.kts') }}
+          restore-keys: |
+            konan-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Restore Swift package cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.SOURCE_PACKAGES_PATH }}
+          key: >-
+            swift-packages-${{ runner.os }}-${{ runner.arch }}-
+            ${{ steps.xcode.outputs.sdk_version }}-
+            ${{ hashFiles('MPVKit/Package.swift', 'iosApp/**/*.resolved') }}
+          restore-keys: |
+            swift-packages-${{ runner.os }}-${{ runner.arch }}-
+            ${{ steps.xcode.outputs.sdk_version }}-
+            swift-packages-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Create local.properties
         shell: bash
@@ -109,40 +173,84 @@ jobs:
         run: |
           set -euo pipefail
 
+          write_property() {
+            local key="$1"
+            local value="$2"
+
+            value="${value//$'\n'/}"
+            value="${value//$'\r'/}"
+
+            printf '%s=%s\n' "$key" "$value"
+          }
+
           {
-            printf 'NUVIO_SUPABASE_URL=%s\n' "${NUVIO_SUPABASE_URL:-}"
-            printf 'NUVIO_SUPABASE_ANON_KEY=%s\n' "${NUVIO_SUPABASE_ANON_KEY:-}"
-            printf 'NUVIO_SUPABASE_FALLBACK_URL=%s\n' "${NUVIO_SUPABASE_FALLBACK_URL:-}"
-            printf 'SENTRY_DSN=%s\n' "${SENTRY_DSN:-}"
-            printf 'NUVIO_REALTIME_SYNC_ENABLED=%s\n' \
+            write_property \
+              "NUVIO_SUPABASE_URL" \
+              "${NUVIO_SUPABASE_URL:-}"
+
+            write_property \
+              "NUVIO_SUPABASE_ANON_KEY" \
+              "${NUVIO_SUPABASE_ANON_KEY:-}"
+
+            write_property \
+              "NUVIO_SUPABASE_FALLBACK_URL" \
+              "${NUVIO_SUPABASE_FALLBACK_URL:-}"
+
+            write_property \
+              "SENTRY_DSN" \
+              "${SENTRY_DSN:-}"
+
+            write_property \
+              "NUVIO_REALTIME_SYNC_ENABLED" \
               "${NUVIO_REALTIME_SYNC_ENABLED:-true}"
 
-            printf 'TRAKT_CLIENT_ID=%s\n' "${TRAKT_CLIENT_ID:-}"
-            printf 'TRAKT_CLIENT_SECRET=%s\n' "${TRAKT_CLIENT_SECRET:-}"
-            printf 'TRAKT_REDIRECT_URI=%s\n' \
+            write_property \
+              "TRAKT_CLIENT_ID" \
+              "${TRAKT_CLIENT_ID:-}"
+
+            write_property \
+              "TRAKT_CLIENT_SECRET" \
+              "${TRAKT_CLIENT_SECRET:-}"
+
+            write_property \
+              "TRAKT_REDIRECT_URI" \
               "${TRAKT_REDIRECT_URI:-nuvio://auth/trakt}"
 
-            printf 'INTRODB_API_URL=%s\n' "${INTRODB_API_URL:-}"
-            printf 'IMDB_RATINGS_API_BASE_URL=%s\n' \
+            write_property \
+              "INTRODB_API_URL" \
+              "${INTRODB_API_URL:-}"
+
+            write_property \
+              "IMDB_RATINGS_API_BASE_URL" \
               "${IMDB_RATINGS_API_BASE_URL:-}"
-            printf 'IMDB_TAPFRAME_API_BASE_URL=%s\n' \
+
+            write_property \
+              "IMDB_TAPFRAME_API_BASE_URL" \
               "${IMDB_TAPFRAME_API_BASE_URL:-}"
-            printf 'PREMIUMIZE_CLIENT_ID=%s\n' \
+
+            write_property \
+              "PREMIUMIZE_CLIENT_ID" \
               "${PREMIUMIZE_CLIENT_ID:-}"
 
-            printf 'CONTRIBUTIONS_URL=%s\n' "${CONTRIBUTIONS_URL:-}"
-            printf 'DONATIONS_BASE_URL=%s\n' "${DONATIONS_BASE_URL:-}"
-            printf 'DONATIONS_DONATE_URL=%s\n' \
+            write_property \
+              "CONTRIBUTIONS_URL" \
+              "${CONTRIBUTIONS_URL:-}"
+
+            write_property \
+              "DONATIONS_BASE_URL" \
+              "${DONATIONS_BASE_URL:-}"
+
+            write_property \
+              "DONATIONS_DONATE_URL" \
               "${DONATIONS_DONATE_URL:-}"
           } > local.properties
 
-          test -f local.properties
+          test -s local.properties
 
-          echo "local.properties created."
-          echo "Configured property names:"
+          echo "Created local.properties with keys:"
           sed 's/=.*$/=<redacted>/' local.properties
 
-      - name: Verify project files
+      - name: Verify build inputs
         shell: bash
         run: |
           set -euo pipefail
@@ -162,72 +270,73 @@ jobs:
             fi
           done
 
-      - name: Resolve Swift packages
-        shell: bash
-        run: |
-          set -o pipefail
-
-          xcodebuild \
-            -resolvePackageDependencies \
-            -project iosApp/iosApp.xcodeproj \
-            -scheme iosApp \
-            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
-            | tee "$RUNNER_TEMP/resolve-packages.log"
-
-      - name: Archive iOS app without signing
+      - name: Build iOS application
         shell: bash
         env:
           GRADLE_OPTS: >-
-            -Xmx12g
+            -Xmx8g
             -Dfile.encoding=UTF-8
-            -XX:MaxMetaspaceSize=2g
-          KOTLIN_DAEMON_JVMARGS: -Xmx8g
-          NUVIO_IOS_DISTRIBUTION: appstore
+            -Dorg.gradle.daemon=false
+            -Dorg.gradle.parallel=true
+            -Dorg.gradle.caching=true
+          KOTLIN_DAEMON_JVMARGS: -Xmx6g
         run: |
+          set -euo pipefail
           set -o pipefail
 
-          xcodebuild archive \
+          mkdir -p \
+            "$DERIVED_DATA_PATH" \
+            "$SOURCE_PACKAGES_PATH"
+
+          xcodebuild build \
             -project iosApp/iosApp.xcodeproj \
             -scheme iosApp \
             -configuration Release \
+            -sdk iphoneos \
             -destination "generic/platform=iOS" \
-            -archivePath "$RUNNER_TEMP/Nuvio.xcarchive" \
-            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
             COMPILER_INDEX_STORE_ENABLE=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            ONLY_ACTIVE_ARCH=YES \
             | tee "$RUNNER_TEMP/xcodebuild.log"
 
-      - name: Locate archived application
+      - name: Locate built application
         id: locate-app
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE_PATH="$RUNNER_TEMP/Nuvio.xcarchive"
-          APPLICATIONS_PATH="$ARCHIVE_PATH/Products/Applications"
-          EXPECTED_APP="$APPLICATIONS_PATH/Nuvio.app"
+          PRODUCTS_PATH="$DERIVED_DATA_PATH/Build/Products/Release-iphoneos"
+          EXPECTED_APP="$PRODUCTS_PATH/Nuvio.app"
 
           if [[ -d "$EXPECTED_APP" ]]; then
             APP_PATH="$EXPECTED_APP"
           else
             APP_PATH="$(
-              find "$APPLICATIONS_PATH" \
+              find "$PRODUCTS_PATH" \
                 -maxdepth 1 \
                 -type d \
-                -name "*.app" \
+                -name '*.app' \
+                ! -name '*Tests.app' \
                 -print \
                 -quit 2>/dev/null || true
             )"
           fi
 
           if [[ -z "${APP_PATH:-}" || ! -d "$APP_PATH" ]]; then
-            echo "::error::No application was found in the Xcode archive"
+            echo "::error::No iOS application was produced"
 
-            echo "Archive contents:"
-            find "$ARCHIVE_PATH" -maxdepth 6 -print || true
+            echo "Build products:"
+            find \
+              "$DERIVED_DATA_PATH/Build/Products" \
+              -maxdepth 4 \
+              -print 2>/dev/null || true
 
             exit 1
           fi
@@ -242,39 +351,38 @@ jobs:
         run: |
           set -euo pipefail
 
-          IPA_DIRECTORY="$RUNNER_TEMP/ipa"
+          IPA_ROOT="$RUNNER_TEMP/ipa"
           IPA_PATH="$GITHUB_WORKSPACE/Nuvio-unsigned.ipa"
+          APP_NAME="$(basename "$APP_PATH")"
 
-          rm -rf "$IPA_DIRECTORY"
+          rm -rf "$IPA_ROOT"
           rm -f "$IPA_PATH"
 
-          mkdir -p "$IPA_DIRECTORY/Payload"
-
-          APP_NAME="$(basename "$APP_PATH")"
+          mkdir -p "$IPA_ROOT/Payload"
 
           ditto \
             "$APP_PATH" \
-            "$IPA_DIRECTORY/Payload/$APP_NAME"
+            "$IPA_ROOT/Payload/$APP_NAME"
 
-          cd "$IPA_DIRECTORY"
+          cd "$IPA_ROOT"
 
-          /usr/bin/zip \
-            -qry \
-            "$IPA_PATH" \
-            Payload
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            Payload \
+            "$IPA_PATH"
 
           if [[ ! -s "$IPA_PATH" ]]; then
             echo "::error::IPA creation failed"
             exit 1
           fi
 
-          echo "IPA created successfully:"
+          echo "IPA created:"
           ls -lh "$IPA_PATH"
 
-          echo "IPA contents:"
-          unzip -l "$IPA_PATH" | head -100
-
-      - name: Upload IPA artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: Nuvio-iOS-unsigned-${{ github.sha }}
@@ -283,13 +391,12 @@ jobs:
           retention-days: 14
           compression-level: 0
 
-      - name: Upload build diagnostics on failure
+      - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Nuvio-iOS-build-diagnostics-${{ github.sha }}
+          name: Nuvio-iOS-build-log-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/resolve-packages.log
             ${{ runner.temp }}/xcodebuild.log
             build/reports/problems
           if-no-files-found: ignore
