@@ -1,0 +1,32 @@
+{
+  "name": "Nuvio",
+  "subtitle": "Unsigned iOS builds",
+  "description": "Official AltStore source for Nuvio.",
+  "iconURL": "https://raw.githubusercontent.com/lightning-pumpkin/NuvioMobile/altstore/icon.png",
+  "headerURL": "https://raw.githubusercontent.com/lightning-pumpkin/NuvioMobile/altstore/icon.png",
+  "website": "https://github.com/lightning-pumpkin/NuvioMobile",
+  "patreonURL": "",
+  "tintColor": "#7C4DFF",
+  "featuredApps": [
+    "com.nuvio.media"
+  ],
+  "apps": [
+    {
+      "name": "Nuvio",
+      "bundleIdentifier": "com.nuvio.media",
+      "developerName": "Nuvio",
+      "subtitle": "Modern media application",
+      "localizedDescription": "Official unsigned builds of Nuvio distributed through AltStore.",
+      "iconURL": "https://raw.githubusercontent.com/lightning-pumpkin/NuvioMobile/altstore/icon.png",
+      "tintColor": "#7C4DFF",
+      "category": "entertainment",
+      "screenshots": [],
+      "versions": [],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {}
+      }
+    }
+  ],
+  "news": []
+}
